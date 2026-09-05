@@ -96,6 +96,23 @@ async fn serve_http(
     mcp_config.legacy_session_mode = true;
     mcp_config.json_response = true;
 
+    // Allow Docker service names (e.g. "vault-mcp") as Host header values.
+    // OBSIDIAN_ALLOWED_HOSTS: comma-separated list of additional allowed hosts.
+    // Set to "*" to disable the check entirely (safe behind a reverse proxy).
+    if let Ok(extra) = std::env::var("OBSIDIAN_ALLOWED_HOSTS") {
+        if extra.trim() == "*" {
+            mcp_config = mcp_config.disable_allowed_hosts();
+        } else {
+            let mut hosts: Vec<String> = vec![
+                "localhost".into(),
+                "127.0.0.1".into(),
+                "::1".into(),
+            ];
+            hosts.extend(extra.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+            mcp_config = mcp_config.with_allowed_hosts(hosts);
+        }
+    }
+
     let health_vault = vault.clone();
     let mcp_service: StreamableHttpService<ObsidianMcp, LocalSessionManager> =
         StreamableHttpService::new(
