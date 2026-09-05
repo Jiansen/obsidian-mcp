@@ -104,15 +104,4 @@ jobs:
         with:
           files: release/*
 
-  publish:
-    name: Publish to crates.io
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Publish
-        run: cargo publish --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+  # crates.io publish removed — this is a fork; upstream owns the crate.
