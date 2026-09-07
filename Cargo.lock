@@ -2323,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "obsidian-mcp"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "axum",
  "bincode",
