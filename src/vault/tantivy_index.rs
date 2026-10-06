@@ -10,10 +10,12 @@ use tantivy::schema::{
     Facet, Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TextFieldIndexing,
     TextOptions, Value,
 };
+use tantivy::tokenizer::{Language, Stemmer, TextAnalyzer};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term, doc};
 
 use super::frontmatter;
 use super::fs;
+use super::tokenizer::{CjkBigramTokenizer, TOKENIZER_NAME};
 use crate::error::{VaultError, VaultResult};
 use crate::models::{NoteMetadata, SearchField};
 
@@ -42,39 +44,41 @@ pub struct TantivySchema {
 impl TantivySchema {
     /// Build the Tantivy schema for vault note indexing.
     ///
-    /// All indexed text fields use the built-in `en_stem` tokenizer (English stemmer)
-    /// with `WithFreqsAndPositions` to support phrase queries and proximity scoring.
+    /// All indexed text fields use the script-aware `cjk_bigram` tokenizer
+    /// (#114): Latin words split like tantivy `default`, CJK runs indexed as
+    /// overlapping character bigrams so unspaced Chinese text is searchable.
+    /// `WithFreqsAndPositions` supports phrase queries and proximity scoring.
     pub fn build() -> Self {
         let mut builder = SchemaBuilder::new();
 
         let f_path = builder.add_text_field("path", STRING | STORED);
 
-        let stemmed_indexing = TextFieldIndexing::default()
-            .set_tokenizer("en_stem")
+        let bigram_indexing = TextFieldIndexing::default()
+            .set_tokenizer(TOKENIZER_NAME)
             .set_index_option(IndexRecordOption::WithFreqsAndPositions);
 
         let f_title = builder.add_text_field(
             "title",
             TextOptions::default()
-                .set_indexing_options(stemmed_indexing.clone())
+                .set_indexing_options(bigram_indexing.clone())
                 .set_stored(),
         );
 
         let f_headings = builder.add_text_field(
             "headings",
-            TextOptions::default().set_indexing_options(stemmed_indexing.clone()),
+            TextOptions::default().set_indexing_options(bigram_indexing.clone()),
         );
 
         let f_tags = builder.add_facet_field("tags", STORED);
 
         let f_body = builder.add_text_field(
             "body",
-            TextOptions::default().set_indexing_options(stemmed_indexing.clone()),
+            TextOptions::default().set_indexing_options(bigram_indexing.clone()),
         );
 
         let f_frontmatter_text = builder.add_text_field(
             "frontmatter_text",
-            TextOptions::default().set_indexing_options(stemmed_indexing),
+            TextOptions::default().set_indexing_options(bigram_indexing),
         );
 
         let schema = builder.build();
@@ -112,6 +116,12 @@ impl TantivyIndex {
     pub fn build(vault_root: &Path, notes: &HashMap<PathBuf, NoteMetadata>) -> VaultResult<Self> {
         let ts = TantivySchema::build();
         let index = Index::create_in_ram(ts.schema.clone());
+        index.tokenizers().register(
+            TOKENIZER_NAME,
+            TextAnalyzer::builder(CjkBigramTokenizer)
+                .filter(Stemmer::new(Language::English))
+                .build(),
+        );
         let mut writer: IndexWriter = index.writer(WRITER_HEAP_BYTES)?;
 
         for (path, meta) in notes {
@@ -647,6 +657,123 @@ mod tests {
             !results.is_empty(),
             "stemming should match 'programs' to 'programming'"
         );
+    }
+
+    // ── CJK bigram regression tests (#114) ──────────────────────────
+
+    fn setup_cjk_vault() -> (tempfile::TempDir, HashMap<PathBuf, NoteMetadata>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(
+            root.join("condensate.md"),
+            "# 凝结水处理系统\n\n凝结水处理系统采用前置阳床加混床工艺，出水电导率小于 0.2 μS/cm。\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("anion.md"),
+            "# 阴离子交换器设计\n\n阴离子交换器直径按流速 15-25 m/h 计算，高硅水取下限。\n",
+        )
+        .unwrap();
+
+        let mut notes = HashMap::new();
+        notes.insert(
+            PathBuf::from("condensate.md"),
+            make_meta("condensate.md", "凝结水处理系统", &[], &["凝结水处理系统"]),
+        );
+        notes.insert(
+            PathBuf::from("anion.md"),
+            make_meta("anion.md", "阴离子交换器设计", &[], &["阴离子交换器设计"]),
+        );
+        (dir, notes)
+    }
+
+    #[test]
+    fn cjk_long_phrase_query_finds_note() {
+        // Before the fix this returned 0 hits: the whole phrase was one token.
+        let (dir, notes) = setup_cjk_vault();
+        let idx = TantivyIndex::build(dir.path(), &notes).unwrap();
+
+        let results = idx.search("凝结水处理系统", 10).unwrap();
+        assert!(
+            results.iter().any(|(p, _)| p == Path::new("condensate.md")),
+            "long CJK phrase must match the condensate note, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn cjk_subword_query_finds_note() {
+        let (dir, notes) = setup_cjk_vault();
+        let idx = TantivyIndex::build(dir.path(), &notes).unwrap();
+
+        let results = idx.search("阴离子交换器", 10).unwrap();
+        assert_eq!(results[0].0, PathBuf::from("anion.md"));
+    }
+
+    #[test]
+    fn cjk_query_does_not_cross_match_unrelated_notes() {
+        let (dir, notes) = setup_cjk_vault();
+        let idx = TantivyIndex::build(dir.path(), &notes).unwrap();
+
+        // "混床工艺" only exists in condensate.md
+        let results = idx.search("混床工艺", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, PathBuf::from("condensate.md"));
+    }
+
+    #[test]
+    fn cjk_single_char_query_documented_gap() {
+        // KNOWN GAP (docs/cjk-bigram-gap-analysis.md): pure bigram indexing
+        // does not index a unigram for chars inside longer runs, so a
+        // single-char query only matches runs of length 1. Matches Lucene
+        // CJKBigramFilter default. Engineering queries here are >=2 chars.
+        let (dir, notes) = setup_cjk_vault();
+        let idx = TantivyIndex::build(dir.path(), &notes).unwrap();
+
+        assert!(idx.search("床", 10).unwrap().is_empty());
+
+        // a note whose title is a single char WOULD match
+        std::fs::write(dir.path().join("bed.md"), "# 床\n\n单字标题。\n").unwrap();
+        let mut notes = notes;
+        notes.insert(PathBuf::from("bed.md"), make_meta("bed.md", "床", &[], &[]));
+        let idx2 = TantivyIndex::build(dir.path(), &notes).unwrap();
+        let results = idx2.search("床", 10).unwrap();
+        assert!(results.iter().any(|(p, _)| p == Path::new("bed.md")));
+    }
+
+    #[test]
+    fn cjk_phrase_beats_scattered_bigrams_via_positions() {
+        // "处理系统" appears verbatim in condensate.md. Because we index with
+        // positions, the QueryParser turns the multi-token query into a
+        // phrase query — a note that merely contains 处…理…系…统 scattered
+        // must NOT outrank the verbatim note.
+        let (dir, notes) = setup_cjk_vault();
+        let idx = TantivyIndex::build(dir.path(), &notes).unwrap();
+
+        let results = idx.search("\"处理系统\"", 10).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].0, PathBuf::from("condensate.md"));
+    }
+
+    #[test]
+    fn mixed_script_query_finds_chinese_note_with_english_terms() {
+        let (dir, mut notes) = setup_cjk_vault();
+        std::fs::write(
+            dir.path().join("edi.md"),
+            "# EDI 模块\n\nEDI (Electrodeionization) 用于混床后精处理。\n",
+        )
+        .unwrap();
+        notes.insert(
+            PathBuf::from("edi.md"),
+            make_meta("edi.md", "EDI 模块", &[], &[]),
+        );
+        let idx = TantivyIndex::build(dir.path(), &notes).unwrap();
+
+        let by_en = idx.search("Electrodeionization", 10).unwrap();
+        assert!(by_en.iter().any(|(p, _)| p == Path::new("edi.md")));
+
+        let by_zh = idx.search("精处理", 10).unwrap();
+        assert!(by_zh.iter().any(|(p, _)| p == Path::new("edi.md")));
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub mod path;
 pub mod periodic;
 pub mod search_utils;
 pub mod tantivy_index;
+pub mod tokenizer;
 pub mod watcher;
 pub mod wikilink;
 
