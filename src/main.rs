@@ -103,12 +103,13 @@ async fn serve_http(
         if extra.trim() == "*" {
             mcp_config = mcp_config.disable_allowed_hosts();
         } else {
-            let mut hosts: Vec<String> = vec![
-                "localhost".into(),
-                "127.0.0.1".into(),
-                "::1".into(),
-            ];
-            hosts.extend(extra.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+            let mut hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+            hosts.extend(
+                extra
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            );
             mcp_config = mcp_config.with_allowed_hosts(hosts);
         }
     }
